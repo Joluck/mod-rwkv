@@ -67,7 +67,7 @@ def build_processor(image_processor_name_or_path=None, max_image_tokens:int=None
         image_processor = AutoImageProcessor.from_pretrained(image_processor_name_or_path, trust_remote_code=True)
     processor = ModRWKVProcessor(tokenizer=tokenizer, image_processor=image_processor)
 
-    if isinstance(max_image_tokens, int) and max_image_tokens > processor.image_processor.size["shortest_edge"]:
+    if isinstance(max_image_tokens, int):
         allowed_pixels = allowed_pixels_from_max_image_tokens(
             max_image_tokens=max_image_tokens,
             patch_size=processor.image_processor.patch_size,
