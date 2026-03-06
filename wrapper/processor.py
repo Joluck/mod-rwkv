@@ -1,10 +1,11 @@
+import copy
+
 from transformers import BaseImageProcessor, PreTrainedTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
 
 
 CHAT_TEMPLATE = (
-    "{{ '<|rwkv_tokenizer_end_of_text|>' }}"
     "{% for message in messages %}"
     "{{ '\x16' + message['role']|capitalize + ': ' }}"
     "{% if message['content'] is string %}"
@@ -35,6 +36,10 @@ class ModRWKVProcessorKwargs(ProcessingKwargs, total=False):
 
 
 class ModRWKVProcessor(ProcessorMixin):
+    attributes = ["image_processor", "tokenizer"]
+    image_processor_class = "AutoImageProcessor"
+    tokenizer_class = "RwkvTokenizer"
+
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer = None,
@@ -55,6 +60,15 @@ class ModRWKVProcessor(ProcessorMixin):
         self.vision_start_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_start_token)
         self.vision_end_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_end_token)
 
+    def to_dict(self):
+        output = {}
+        if self.image_processor is not None:
+            output["image_processor"] = self.image_processor.to_dict()
+        if getattr(self, "auto_map", None) is not None:
+            output["auto_map"] = copy.deepcopy(self.auto_map)
+        output["processor_class"] = self.__class__.__name__
+        return output
+
     def _flatten_images(self, images):
         if images is None:
             return []
@@ -69,50 +83,42 @@ class ModRWKVProcessor(ProcessorMixin):
                 flat_images.append(item)
         return flat_images
 
-    def _get_image_sizes(self, images):
-        image_sizes = []
-        for image in self._flatten_images(images):
-            if hasattr(image, "size"):
-                width, height = image.size
-            elif hasattr(image, "shape") and len(image.shape) >= 2:
-                height, width = image.shape[-2], image.shape[-1]
-            else:
-                raise TypeError(f"Unsupported image type for size extraction: {type(image)!r}")
-            image_sizes.append([height, width])
-        return image_sizes
-
-
-
-
-    def _get_num_multimodal_tokens(self, image_sizes=None, **kwargs):
-        """
-        Computes the number of placeholder tokens needed for multimodal inputs with the given sizes.
-        Args:
-            image_sizes (`list[list[int]]`, *optional*):
-                The input sizes formatted as (height, width) per each image.
-            video_sizes (`list[list[int]]`, *optional*):
-                The input sizes formatted as (num_frames, height, width) per each video.
-        Returns:
-            `MultiModalData`: A `MultiModalData` object holding number of tokens per each of the provided
-            input modalities, along with other useful data.
-        """
-
+    def _get_num_multimodal_tokens(self, image_grid_thw=None, **kwargs):
         vision_data = {}
-        if image_sizes is not None:
+        if image_grid_thw is not None:
             processor_defaults = getattr(self.image_processor, "_defaults", {})
-            images_kwargs = processor_defaults.get("images_kwargs", {})
+            images_kwargs = dict(processor_defaults.get("images_kwargs", {}))
             images_kwargs.update(kwargs)
             merge_size = images_kwargs.get("merge_size", None) or self.image_processor.merge_size
 
-            num_image_patches = [
-                self.image_processor.get_number_of_image_patches(*image_size, images_kwargs)
-                for image_size in image_sizes
-            ]
-            num_image_tokens = [(num_patches // merge_size**2) for num_patches in num_image_patches]
+            num_image_patches = [int(grid[0] * grid[1] * grid[2]) for grid in image_grid_thw]
+            num_image_tokens = [num_patches // merge_size**2 for num_patches in num_image_patches]
             vision_data.update({"num_image_tokens": num_image_tokens, "num_image_patches": num_image_patches})
 
-
         return MultiModalData(**vision_data)
+
+    def _count_token_occurrences(self, input_ids, token_id):
+        counts = []
+        for sample_ids in input_ids:
+            counts.append(sum(1 for token in sample_ids if token == token_id))
+        return counts
+
+    def _validate_image_token_alignment(self, text_inputs, expected_image_tokens, expected_num_images):
+        input_ids = text_inputs["input_ids"]
+        actual_image_tokens = self._count_token_occurrences(input_ids, self.image_token_id)
+        actual_vision_starts = self._count_token_occurrences(input_ids, self.vision_start_token_id)
+        actual_vision_ends = self._count_token_occurrences(input_ids, self.vision_end_token_id)
+
+        if actual_image_tokens != expected_image_tokens:
+            raise ValueError(
+                "Image token count does not match image_grid_thw-derived token count: "
+                f"expected {expected_image_tokens}, got {actual_image_tokens}."
+            )
+        if actual_vision_starts != expected_num_images or actual_vision_ends != expected_num_images:
+            raise ValueError(
+                "Vision boundary token count does not match the number of image placeholders: "
+                f"expected {expected_num_images}, got starts={actual_vision_starts}, ends={actual_vision_ends}."
+            )
 
 
 
@@ -124,11 +130,10 @@ class ModRWKVProcessor(ProcessorMixin):
         )
 
         if images is not None:
-            image_sizes = self._get_image_sizes(images)
             image_inputs = self.image_processor(images=images, **output_kwargs["images_kwargs"])
             image_grid_thw = image_inputs["image_grid_thw"]
             multimodal_tokens = self._get_num_multimodal_tokens(
-                image_sizes=image_sizes,
+                image_grid_thw=image_grid_thw,
                 **output_kwargs["images_kwargs"],
             )
             num_image_tokens = multimodal_tokens.num_image_tokens
@@ -144,16 +149,28 @@ class ModRWKVProcessor(ProcessorMixin):
             text = [text]
 
         text = text.copy()  # below lines change text in-place
+        expected_image_tokens = [0 for _ in text]
+        expected_num_images = [0 for _ in text]
         if image_grid_thw is not None:
             index = 0
             for i in range(len(text)):
                 while self.image_token in text[i]:
                     text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens[index], 1)
+                    expected_image_tokens[i] += num_image_tokens[index]
+                    expected_num_images[i] += 1
                     index += 1
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
+            if index != len(num_image_tokens):
+                raise ValueError(
+                    "Number of image placeholders in text does not match provided images: "
+                    f"consumed {index}, available {len(num_image_tokens)}."
+                )
+
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+        if image_grid_thw is not None:
+            self._validate_image_token_alignment(text_inputs, expected_image_tokens, expected_num_images)
         self._check_special_mm_tokens(text, text_inputs, modalities=["image"])
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
 
@@ -193,7 +210,7 @@ if __name__ == "__main__":
             "content": [
                 {
                     "type": "image",
-                    "image": Image.open("/home/rwkv/molin/mod-rwkv/demo.jpeg").convert("RGB"),
+                    "image": Image.open("docs/03-Confusing-Pictures.jpg").convert("RGB"),
                 },
                 {"type": "text", "text": "Describe this image."},
             ],
@@ -211,4 +228,5 @@ if __name__ == "__main__":
     outputs = processor.batch_decode(inputs["input_ids"], skip_special_tokens=False)
     print(outputs)
 
-    
+
+ModRWKVProcessor.register_for_auto_class("AutoProcessor")

@@ -32,7 +32,7 @@ VOCAB_FILES_NAMES = {
     "vocab_file": "wr_vocab_v20230424.txt",
 }
 
-CHAT_TEMPLATE = "{{ '<|rwkv_tokenizer_end_of_text|>' }}{% for message in messages %}{% if message['role'] == 'user' %}{{'\x16User: ' + message['content'] + '\x17'}}{% elif message['role'] == 'system' %}{{'\x16System: ' + message['content'] + '\x17'}}{% elif message['role'] == 'assistant' %}{{'\x16Assistant: ' + message['content'] + '\x17'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '\x16Assistant: <think></think>' }}{% endif %}"
+CHAT_TEMPLATE = "{% for message in messages %}{% if message['role'] == 'user' %}{{'\x16User: ' + message['content'] + '\x17'}}{% elif message['role'] == 'system' %}{{'\x16System: ' + message['content'] + '\x17'}}{% elif message['role'] == 'assistant' %}{{'\x16Assistant: ' + message['content'] + '\x17'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '\x16Assistant: <think></think>' }}{% endif %}"
 
 
 
@@ -269,28 +269,23 @@ class RwkvTokenizer(PreTrainedTokenizer):
     def save_vocabulary(
         self, save_directory: str, filename_prefix: Optional[str] = None
     ) -> Tuple[str]:
-        index = 0
         if os.path.isdir(save_directory):
             vocab_file = os.path.join(
                 save_directory,
-                (filename_prefix + "-" if filename_prefix else "") + "vocab.txt",
+                (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"],
             )
         else:
             vocab_file = (
                 filename_prefix + "-" if filename_prefix else ""
             ) + save_directory
         with open(vocab_file, "w", encoding="utf-8") as writer:
-            for token, token_index in sorted(
-                self.encoder.items(), key=lambda kv: kv[1]
-            ):
-                if index != token_index:
-                    logger.warning(
-                        f"Saving vocabulary to {vocab_file}: vocabulary indices are not consecutive."
-                        " Please check that the vocabulary is not corrupted!"
-                    )
-                    index = token_index
-                writer.write(str(token) + "\n")
-                index += 1
+            for token_index, token in sorted(self.decoder.items()):
+                if isinstance(token, str):
+                    token_bytes = token.encode("utf-8")
+                else:
+                    token_bytes = token
+
+                writer.write(f"{token_index} {repr(token)} {len(token_bytes)}\n")
         return (vocab_file,)
 
     def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
