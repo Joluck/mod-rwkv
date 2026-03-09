@@ -3,12 +3,14 @@ hf compatible dataset
 '''
 import os
 
-os.environ["HF_DATASETS_CACHE"]="/mnt/raid0_8t/huggingface/datasets"
+import lightning as L
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from torch.utils.data import DataLoader, Dataset
-
 from transformers import AutoProcessor
+
+
+os.environ.setdefault("HF_DATASETS_CACHE", "/mnt/raid0_8t/huggingface/datasets")
 
 
 ROLE_TABLE = {
@@ -21,6 +23,10 @@ ROLE_TABLE = {
 
 
 _PROCESSOR_CACHE = {}
+
+
+def _clear_processor_cache(_worker_id=None):
+    _PROCESSOR_CACHE.clear()
 
 
 def _get_processor(processor_path):
@@ -42,7 +48,9 @@ def _normalize_chat(message):
     if texts is None:
         raise ValueError("No valid text field found in the dataset item.")
 
-    if not isinstance(images, list):
+    if images is None:
+        images = []
+    elif not isinstance(images, list):
         images = [images]
 
     if not texts:
@@ -64,7 +72,7 @@ def _normalize_chat(message):
     else:
         raise NotImplementedError("No valid chat format found in the dataset item.")
 
-    return normalized_texts, images
+    return normalized_texts, [image for image in images if image is not None]
 
 
 def _build_messages(texts, images):
@@ -80,6 +88,25 @@ def _build_messages(texts, images):
             }
         )
     return messages
+
+
+def _normalize_images(images):
+    normalized_images = []
+    for image in images:
+        if hasattr(image, "convert"):
+            normalized_images.append(image.convert("RGB"))
+        else:
+            normalized_images.append(image)
+    return normalized_images
+
+
+def _render_chat(processor, texts, images):
+    messages = _build_messages(texts, images)
+    return processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 
 
 def _get_image_token_lengths(processor, image_grid_thw):
@@ -135,51 +162,55 @@ def _build_inputs_and_labels(processor, texts, image_token_lengths, seqlen):
     return input_tensor[:-1], label_tensor[1:]
 
 
-def _tidyup_dataset_batch(item, processor_path, seqlen):
-    processor = _get_processor(processor_path)
-    batch_size = len(next(iter(item.values())))
-    rendered_texts = []
-
-    for index in range(batch_size):
-        sample = {key: value[index] for key, value in item.items()}
-        texts, images = _normalize_chat(sample)
-        messages = _build_messages(texts, images)
-
-        rendered_texts.append(
-            processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        )
-
-    return {"text": rendered_texts}
-
-
 class HFDataset(Dataset):
-    def __init__(self, dataset_path, processor_path, split='train', num_proc=24, seqlen=4096):
-        dataset = load_dataset(dataset_path, split=split, num_proc=num_proc)
+    def __init__(self, dataset_path, processor_path, split='train', num_proc=None, seqlen=4096, cache_dir=None):
         self.processor_path = processor_path
+        self.dataset_path = dataset_path
+        self.split = split
+        self.num_proc = num_proc
         self.seqlen = seqlen
-        self.raw_dataset = dataset
-        remove_columns = list(dataset.column_names)
+        self.cache_dir = cache_dir or os.environ.get("HF_DATASETS_CACHE")
+        self.dataset = None
+        self.dataset_length = None
 
-        self.dataset = dataset.map(
-            function=_tidyup_dataset_batch,
-            batched=True,
-            batch_size=1024,
-            num_proc=num_proc,
-            fn_kwargs={"processor_path": processor_path, "seqlen": seqlen},
-            remove_columns=remove_columns,
-        )
+    def _get_dataset_length(self):
+        if self.dataset_length is None:
+            try:
+                builder = load_dataset_builder(
+                    self.dataset_path,
+                    cache_dir=self.cache_dir,
+                )
+                split_info = builder.info.splits[self.split]
+                self.dataset_length = split_info.num_examples
+            except Exception:
+                self.dataset_length = len(self._get_dataset())
+        return self.dataset_length
+
+    def _get_dataset(self):
+        if self.dataset is None:
+            self.dataset = load_dataset(
+                self.dataset_path,
+                split=self.split,
+                cache_dir=self.cache_dir,
+                keep_in_memory=False,
+            )
+        return self.dataset
+
+    def release(self):
+        self.dataset = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["dataset"] = None
+        return state
 
     def __len__(self):
-        return len(self.dataset)
+        return self._get_dataset_length()
 
     def __getitem__(self, idx):
         '''
-        Return processed input for the model. 
-        - pixel_values: list of patched images from processor. 
+        Return processed input for the model.
+        - pixel_values: list of patched images from processor.
         - input_ids: tokenized text inputs of shape [B, L]
         - label_ids: Labels for masking out the loss, of shape [B, L], where -100 indicates positions that should be ignored in the loss computation. Mask out user inputs in default.
         '''
@@ -187,10 +218,10 @@ class HFDataset(Dataset):
             return [self[i] for i in range(*idx.indices(len(self)))]
 
         processor = _get_processor(self.processor_path)
-        raw_item = self.raw_dataset[idx]
-        item = self.dataset[idx]
-        texts, images = _normalize_chat(raw_item)
-        rendered_text = item["text"]
+        sample = self._get_dataset()[idx]
+        texts, images = _normalize_chat(sample)
+        images = _normalize_images(images)
+        rendered_text = _render_chat(processor, texts, images)
 
         if images:
             model_inputs = processor(
@@ -203,10 +234,6 @@ class HFDataset(Dataset):
             if "image_grid_thw" in model_inputs:
                 pixel_values["image_grid_thw"] = model_inputs["image_grid_thw"]
         else:
-            model_inputs = processor(
-                text=rendered_text,
-                return_tensors="pt",
-            )
             image_token_lengths = []
             pixel_values = None
 
@@ -227,6 +254,23 @@ def hf_collate_fn(batch):
     return batch_pixel_values, batch_input_ids, batch_label_ids
 
 
+def _resolve_dataloader_settings(num_workers, persistent_workers, prefetch_factor, max_inflight_batches):
+    if num_workers <= 0:
+        return 0, False, None, None
+
+    effective_prefetch_factor = 1 if prefetch_factor is None else max(prefetch_factor, 1)
+    effective_num_workers = min(
+        num_workers,
+        max(1, max(max_inflight_batches, 1) // effective_prefetch_factor),
+    )
+    return (
+        effective_num_workers,
+        persistent_workers and effective_num_workers > 0,
+        effective_prefetch_factor,
+        None,
+    )
+
+
 def create_hf_dataloader(
     dataset_path,
     processor_path,
@@ -234,10 +278,12 @@ def create_hf_dataloader(
     batch_size=1,
     shuffle=True,
     num_workers=0,
-    num_proc=24,
+    num_proc=None,
     seqlen=4096,
     pin_memory=True,
     persistent_workers=False,
+    prefetch_factor=None,
+    max_inflight_batches=2,
 ):
     dataset = HFDataset(
         dataset_path=dataset_path,
@@ -246,31 +292,163 @@ def create_hf_dataloader(
         num_proc=num_proc,
         seqlen=seqlen,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
+    effective_num_workers, effective_persistent_workers, effective_prefetch_factor, multiprocessing_context = _resolve_dataloader_settings(
         num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers if num_workers > 0 else False,
-        collate_fn=hf_collate_fn,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        max_inflight_batches=max_inflight_batches,
     )
-    
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": effective_num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": effective_persistent_workers,
+        "collate_fn": hf_collate_fn,
+        "worker_init_fn": _clear_processor_cache,
+    }
+    if effective_prefetch_factor is not None:
+        dataloader_kwargs["prefetch_factor"] = effective_prefetch_factor
+    if multiprocessing_context is not None:
+        dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
+    return DataLoader(**dataloader_kwargs)
+
+
+class HFDataModule(L.LightningDataModule):
+    def __init__(
+        self,
+        dataset_path,
+        processor_path,
+        train_split='train',
+        val_split=None,
+        batch_size=1,
+        shuffle=True,
+        num_workers=0,
+        num_proc=None,
+        seqlen=4096,
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=None,
+        max_inflight_batches=2,
+    ):
+        super().__init__()
+        self.dataset_path = dataset_path
+        self.processor_path = processor_path
+        self.train_split = train_split
+        self.val_split = val_split
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.num_proc = num_proc
+        self.seqlen = seqlen
+        self.pin_memory = pin_memory
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
+        self.max_inflight_batches = max_inflight_batches
+        self.train_dataset = None
+        self.val_dataset = None
+        self.cache_dir = os.environ.get("HF_DATASETS_CACHE")
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            dataset_path=args.data_file,
+            processor_path=args.processor_path,
+            train_split=getattr(args, "sft_split", "train"),
+            batch_size=args.micro_bsz,
+            shuffle=bool(getattr(args, "data_shuffle", 1)),
+            num_workers=args.num_workers,
+            num_proc=getattr(args, "num_proc", None),
+            seqlen=args.ctx_len,
+            pin_memory=True,
+            persistent_workers=getattr(args, "persistent_workers", False),
+            prefetch_factor=getattr(args, "prefetch_factor", None),
+            max_inflight_batches=getattr(args, "max_inflight_batches", 2),
+        )
+
+    def prepare_data(self):
+        AutoProcessor.from_pretrained(
+            self.processor_path,
+            trust_remote_code=True,
+            use_fast=True,
+        )
+
+    def setup(self, stage=None):
+        if stage in (None, 'fit') and self.train_dataset is None:
+            self.train_dataset = HFDataset(
+                dataset_path=self.dataset_path,
+                processor_path=self.processor_path,
+                split=self.train_split,
+                num_proc=self.num_proc,
+                seqlen=self.seqlen,
+                cache_dir=self.cache_dir,
+            )
+
+        if stage in (None, 'fit', 'validate') and self.val_split is not None and self.val_dataset is None:
+            self.val_dataset = HFDataset(
+                dataset_path=self.dataset_path,
+                processor_path=self.processor_path,
+                split=self.val_split,
+                num_proc=self.num_proc,
+                seqlen=self.seqlen,
+                cache_dir=self.cache_dir,
+            )
+
+    def _build_dataloader(self, dataset, shuffle):
+        effective_num_workers, effective_persistent_workers, effective_prefetch_factor, multiprocessing_context = _resolve_dataloader_settings(
+            num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
+            prefetch_factor=self.prefetch_factor,
+            max_inflight_batches=self.max_inflight_batches,
+        )
+        dataloader_kwargs = {
+            "dataset": dataset,
+            "batch_size": self.batch_size,
+            "shuffle": shuffle,
+            "num_workers": effective_num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": effective_persistent_workers,
+            "collate_fn": hf_collate_fn,
+            "worker_init_fn": _clear_processor_cache,
+        }
+        if effective_prefetch_factor is not None:
+            dataloader_kwargs["prefetch_factor"] = effective_prefetch_factor
+        if multiprocessing_context is not None:
+            dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
+        return DataLoader(**dataloader_kwargs)
+
+    def train_dataloader(self):
+        return self._build_dataloader(self.train_dataset, self.shuffle)
+
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            return None
+        return self._build_dataloader(self.val_dataset, False)
+
+    def teardown(self, stage=None):
+        if self.train_dataset is not None:
+            self.train_dataset.release()
+        if self.val_dataset is not None:
+            self.val_dataset.release()
+
+        if stage in (None, 'fit', 'validate', 'test', 'predict'):
+            self.train_dataset = None
+            self.val_dataset = None
+
+        _PROCESSOR_CACHE.clear()
+
 
 if __name__ == "__main__":
-    
-    dataset_path = "/mnt/sda1/HuggingFaceM4_FineVisionMax/"
+    dataset_path = "/mnt/sda1/xhs_caption_2/"
     processor_name = "/home/rwkv/molin/mod-rwkv/processor_bundle"
-    dataloader = create_hf_dataloader(
-        dataset_path=dataset_path,
-        processor_path=processor_name,
-        batch_size=32,
-        shuffle=True,
-        num_workers=32,
-        num_proc=24,
-        seqlen=4096,
-    )
+    # dataloader = create_hf_dataloader(
+    #     dataset_path=dataset_path,
+    #     processor_path=processor_name,
+    #     batch_size=32,
+    #     shuffle=True,
+    #     num_workers=32,
+    #     num_proc=24,
+    #     seqlen=4096,
+    # )
 
-    batch = next(iter(dataloader))
-    print(batch[0][0].keys() if batch[0][0] is not None else None)
-    print(batch[1].shape, batch[2].shape)
