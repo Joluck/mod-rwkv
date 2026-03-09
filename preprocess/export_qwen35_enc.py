@@ -36,27 +36,27 @@ def allowed_pixels_from_max_image_tokens(max_image_tokens: int, patch_size: int 
 
 def export_vision_bundle(src_model_path: str, bundle_out: Path, max_image_tokens: int = 1024):
     bundle_out.mkdir(parents=True, exist_ok=False)
-    processor :Qwen3VLProcessor= AutoProcessor.from_pretrained(src_model_path, trust_remote_code=True)
+    # processor :Qwen3VLProcessor= AutoProcessor.from_pretrained(src_model_path, trust_remote_code=True)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(src_model_path, trust_remote_code=True)
 
     vision_model = model.model.visual
 
-    allowed_pixels = allowed_pixels_from_max_image_tokens(
-        max_image_tokens=max_image_tokens,
-        patch_size=processor.image_processor.patch_size,
-        merge_size=processor.image_processor.merge_size,
-    )
-    print(f"Configuring processor image_processor.size.longest_edge to {allowed_pixels} to correspond to max_image_tokens={max_image_tokens}")
-    processor.image_processor.size["longest_edge"] = int(allowed_pixels)
+    # allowed_pixels = allowed_pixels_from_max_image_tokens(
+    #     max_image_tokens=max_image_tokens,
+    #     patch_size=processor.image_processor.patch_size,
+    #     merge_size=processor.image_processor.merge_size,
+    # )
+    # print(f"Configuring processor image_processor.size.longest_edge to {allowed_pixels} to correspond to max_image_tokens={max_image_tokens}")
+    # processor.image_processor.size["longest_edge"] = int(allowed_pixels)
 
     
 
 
     vision_model.save_pretrained(bundle_out, safe_serialization=True)
-    processor.save_pretrained(bundle_out)
+    # processor.save_pretrained(bundle_out)
 
 
-    return vision_model, processor, allowed_pixels
+    return vision_model, None, None
 
 
 if __name__ == "__main__":
