@@ -7,16 +7,21 @@ from transformers.processing_utils import MultiModalData, ProcessingKwargs, Proc
 
 CHAT_TEMPLATE = (
     "{% for message in messages %}"
-    "{{ '\x16' + message['role']|capitalize + ': ' }}"
+    "{{ '\x16' + ('Assistant' if message['role'] == 'assistant' else 'System' if message['role'] == 'system' else 'User') + ': ' }}"
     "{% if message['content'] is string %}"
     "{{ message['content'] }}"
     "{% else %}"
+    "{% set ns = namespace(explicit_image_tags=0, image_items=0) %}"
     "{% for item in message['content'] %}"
     "{% if item['type'] == 'text' %}"
     "{{ item['text'] }}"
+    "{% set ns.explicit_image_tags = ns.explicit_image_tags + item['text'].count('<image>') %}"
     "{% elif item['type'] in ['image', 'image_url'] %}"
-    "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"
+    "{% set ns.image_items = ns.image_items + 1 %}"
     "{% endif %}"
+    "{% endfor %}"
+    "{% for _ in range([ns.image_items - ns.explicit_image_tags, 0] | max) %}"
+    "{{ '<image>' }}"
     "{% endfor %}"
     "{% endif %}"
     "{{ '\x17' }}"
@@ -39,6 +44,7 @@ class ModRWKVProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "RwkvTokenizer"
+    user_image_tag = "<image>"
 
     def __init__(
         self,
@@ -59,6 +65,7 @@ class ModRWKVProcessor(ProcessorMixin):
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
         self.vision_start_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_start_token)
         self.vision_end_token_id = self.tokenizer.convert_tokens_to_ids(self.vision_end_token)
+        self.vision_image_token = f"{self.vision_start_token}{self.image_token}{self.vision_end_token}"
 
     def to_dict(self):
         output = {}
@@ -82,6 +89,23 @@ class ModRWKVProcessor(ProcessorMixin):
             else:
                 flat_images.append(item)
         return flat_images
+
+    def _get_num_images_per_text_sample(self, images, batch_size):
+        if images is None:
+            return [0] * batch_size
+        if batch_size == 1:
+            return [len(self._flatten_images(images))]
+        if isinstance(images, (list, tuple)) and len(images) == batch_size:
+            return [len(self._flatten_images(sample_images)) for sample_images in images]
+        return None
+
+    def _normalize_image_tags(self, text):
+        return text.replace(self.user_image_tag, self.vision_image_token)
+
+    def _append_missing_image_tags(self, text, num_missing_images):
+        if num_missing_images <= 0:
+            return text
+        return text + self.vision_image_token * num_missing_images
 
     def _get_num_multimodal_tokens(self, image_grid_thw=None, **kwargs):
         vision_data = {}
@@ -152,9 +176,19 @@ class ModRWKVProcessor(ProcessorMixin):
         expected_image_tokens = [0 for _ in text]
         expected_num_images = [0 for _ in text]
         if image_grid_thw is not None:
+            num_images_per_sample = self._get_num_images_per_text_sample(images, len(text))
             index = 0
             for i in range(len(text)):
+                text[i] = self._normalize_image_tags(text[i])
+                if num_images_per_sample is not None:
+                    missing_image_tags = num_images_per_sample[i] - text[i].count(self.image_token)
+                    text[i] = self._append_missing_image_tags(text[i], missing_image_tags)
                 while self.image_token in text[i]:
+                    if index >= len(num_image_tokens):
+                        raise ValueError(
+                            "Number of image placeholders in text exceeds provided images: "
+                            f"consumed {index + 1}, available {len(num_image_tokens)}."
+                        )
                     text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens[index], 1)
                     expected_image_tokens[i] += num_image_tokens[index]
                     expected_num_images[i] += 1
@@ -174,7 +208,7 @@ class ModRWKVProcessor(ProcessorMixin):
         self._check_special_mm_tokens(text, text_inputs, modalities=["image"])
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
 
-
+ModRWKVProcessor.register_for_auto_class("AutoProcessor")
 
 
 if __name__ == "__main__":
@@ -202,8 +236,7 @@ if __name__ == "__main__":
     # outputs = processor.decode(inputs["input_ids"], skip_special_tokens = False)
     # print(outputs)
 
-    # Image + text test
-
+    # Image + text test without explicit image tag
     messages = [
         {
             "role": "user",
@@ -229,4 +262,3 @@ if __name__ == "__main__":
     print(outputs)
 
 
-ModRWKVProcessor.register_for_auto_class("AutoProcessor")

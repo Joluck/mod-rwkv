@@ -151,6 +151,31 @@ def test_saved_processor(processor_path):
     print(outputs)
 
 
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": Image.open("docs/03-Confusing-Pictures.jpg").convert("RGB"),
+                },
+                {"type": "text", "text": "Describe <image> and list out objects."},
+            ],
+        }
+    ]
+
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    assert_image_token_alignment(processor, inputs)
+    print(inputs.keys())
+    outputs = processor.batch_decode(inputs["input_ids"], skip_special_tokens=False)
+    print(outputs)
+
 def main():
     args = parse_args()
     output_path = prepare_output_dir(args.output_dir, force=args.force)
