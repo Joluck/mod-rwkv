@@ -116,6 +116,7 @@ parser.add_argument("--op", default="cuda", type=str)
 #World
 parser.add_argument("--encoder_path", default="", type=str)  # full path, with .pth
 parser.add_argument("--encoder_type", default="", type=str)  # full path, with .pth
+parser.add_argument("--processor_path", default="", type=str)  # HF processor path (separate from encoder)
 parser.add_argument("--copy", default=1, type=int)
 
 
@@ -129,6 +130,7 @@ parser.add_argument("--accumulate_grad_batches", default=1, type=int)
 parser.add_argument("--num_workers", default=16, type=int)
 parser.add_argument("--persistent_workers", action="store_true")
 parser.add_argument("--prefetch_factor", default=None, type=int)
+parser.add_argument("--max_inflight_batches", default=2, type=int)
 
 parser.add_argument("--grad_cp_layers", default=0, type=int)
 args = parser.parse_args()
@@ -160,13 +162,22 @@ args.logger = False
 args.gradient_clip_val = 1.0
 args.num_sanity_val_steps = 0
 args.check_val_every_n_epoch = int(1e20)
-args.log_every_n_steps = int(1e20)
+args.log_every_n_steps = 1
 args.max_epochs = args.epoch_count
 
 args.epoch_steps = args.epoch_steps*args.copy
 
 args.betas = (args.beta1, args.beta2)
 args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
+
+if args.epoch_steps < 0:
+    from datasets import load_dataset_builder
+    _cache_dir = os.environ.get("HF_DATASETS_CACHE")
+    _builder = load_dataset_builder(args.data_file, cache_dir=_cache_dir)
+    _split = getattr(args, "sft_split", "train")
+    _total_samples = _builder.info.splits[_split].num_examples
+    args.epoch_steps = _total_samples // args.real_bsz
+    rank_zero_info(f"Resolved epoch_steps=-1 to {args.epoch_steps} ({_total_samples} samples / {args.real_bsz} bsz)")
 os.environ["RWKV_MY_TESTING"] = args.my_testing
 os.environ["RWKV_CTXLEN"] = str(args.ctx_len)
 os.environ["RWKV_HEAD_SIZE_A"] = str(args.head_size_a)
@@ -256,7 +267,7 @@ else:
 ########################################################################################################
 
 from lg_train.trainer import train_callback
-from lg_train.dataset import WorldDataModule
+from lg_train.dataset_hf import HFDataModule
 from lg_train.world_load import WorldLoading
 
 model = WorldLoading(args)
@@ -265,9 +276,10 @@ model = WorldLoading(args)
 
 trainer = Trainer(accelerator=args.accelerator,strategy=args.strategy,devices=args.devices,num_nodes=args.num_nodes,precision=args.precision,
 logger=args.logger,callbacks=[train_callback(args)],max_epochs=args.max_epochs,check_val_every_n_epoch=args.check_val_every_n_epoch,num_sanity_val_steps=args.num_sanity_val_steps,
-log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val)
+log_every_n_steps=args.log_every_n_steps,enable_checkpointing=args.enable_checkpointing,accumulate_grad_batches=args.accumulate_grad_batches,gradient_clip_val=args.gradient_clip_val,
+limit_train_batches=args.epoch_steps,use_distributed_sampler=False)
 
 
 
-datamodule = WorldDataModule(args)
+datamodule = HFDataModule.from_args(args)
 trainer.fit(model, datamodule)

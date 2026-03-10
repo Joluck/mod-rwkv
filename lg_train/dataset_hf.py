@@ -6,7 +6,7 @@ import os
 import lightning as L
 import torch
 from datasets import load_dataset, load_dataset_builder
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import AutoProcessor
 
 
@@ -130,12 +130,14 @@ def _build_inputs_and_labels(processor, texts, image_token_lengths, seqlen):
         content = msg["value"]
 
         if msg_index == 0 and image_token_lengths:
+            image_prefix = ""
             for token_length in image_token_lengths:
-                content += (
+                image_prefix += (
                     processor.vision_start_token
                     + processor.image_token * token_length
                     + processor.vision_end_token
                 )
+            content = image_prefix + content
 
         tokenized = processor.tokenizer(
             f"\x16{role_name}: {content}\x17",
@@ -246,6 +248,111 @@ class HFDataset(Dataset):
         return pixel_values, input_ids, label_ids
 
 
+class HFStreamingDataset(IterableDataset):
+    """Streaming dataset that reads HF parquet files on-the-fly without caching."""
+
+    def __init__(self, dataset_path, processor_path, split='train', seqlen=4096,
+                 shuffle_buffer=1000, seed=42, cache_dir=None):
+        self.dataset_path = dataset_path
+        self.processor_path = processor_path
+        self.split = split
+        self.seqlen = seqlen
+        self.shuffle_buffer = shuffle_buffer
+        self.seed = seed
+        self.cache_dir = cache_dir or os.environ.get("HF_DATASETS_CACHE")
+        self._epoch = 0
+        self._length = None
+
+    def _read_length(self):
+        if self._length is None:
+            try:
+                builder = load_dataset_builder(
+                    self.dataset_path,
+                    cache_dir=self.cache_dir,
+                )
+                self._length = builder.info.splits[self.split].num_examples
+            except Exception:
+                self._length = 0
+        return self._length
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
+
+    def __len__(self):
+        return self._read_length()
+
+    def __iter__(self):
+        import torch.distributed as dist
+
+        ds = load_dataset(self.dataset_path, split=self.split, streaming=True)
+
+        rank, world_size = 0, 1
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+
+        worker_info = torch.utils.data.get_worker_info()
+        num_workers, worker_id = 1, 0
+        if worker_info is not None:
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
+
+        total_shards = world_size * num_workers
+        shard_index = rank * num_workers + worker_id
+
+        num_sources = ds.n_shards
+        skip_mod = None
+        if total_shards > 1:
+            if num_sources >= total_shards:
+                ds = ds.shard(num_shards=total_shards, index=shard_index)
+            else:
+                skip_mod = (total_shards, shard_index)
+
+        if self.shuffle_buffer > 0:
+            ds = ds.shuffle(
+                buffer_size=self.shuffle_buffer,
+                seed=self.seed + self._epoch,
+            )
+
+        processor = _get_processor(self.processor_path)
+        for i, sample in enumerate(ds):
+            if skip_mod is not None and i % skip_mod[0] != skip_mod[1]:
+                continue
+            try:
+                yield _process_sample(sample, processor, self.seqlen)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Skipping sample: {e}")
+                continue
+
+
+def _process_sample(sample, processor, seqlen):
+    texts, images = _normalize_chat(sample)
+    images = _normalize_images(images)
+    rendered_text = _render_chat(processor, texts, images)
+
+    if images:
+        model_inputs = processor(
+            images=images,
+            text=rendered_text,
+            return_tensors="pt",
+        )
+        image_token_lengths = _get_image_token_lengths(
+            processor, model_inputs.get("image_grid_thw"),
+        )
+        pixel_values = {"pixel_values": model_inputs["pixel_values"]}
+        if "image_grid_thw" in model_inputs:
+            pixel_values["image_grid_thw"] = model_inputs["image_grid_thw"]
+    else:
+        image_token_lengths = []
+        pixel_values = None
+
+    input_ids, label_ids = _build_inputs_and_labels(
+        processor, texts, image_token_lengths, seqlen,
+    )
+    return pixel_values, input_ids, label_ids
+
+
 def hf_collate_fn(batch):
     pixel_values, input_ids, label_ids = zip(*batch)
     batch_pixel_values = list(pixel_values)
@@ -331,6 +438,8 @@ class HFDataModule(L.LightningDataModule):
         persistent_workers=False,
         prefetch_factor=None,
         max_inflight_batches=2,
+        streaming=False,
+        shuffle_buffer=1000,
     ):
         super().__init__()
         self.dataset_path = dataset_path
@@ -346,12 +455,15 @@ class HFDataModule(L.LightningDataModule):
         self.persistent_workers = persistent_workers
         self.prefetch_factor = prefetch_factor
         self.max_inflight_batches = max_inflight_batches
+        self.streaming = streaming
+        self.shuffle_buffer = shuffle_buffer
         self.train_dataset = None
         self.val_dataset = None
         self.cache_dir = os.environ.get("HF_DATASETS_CACHE")
 
     @classmethod
     def from_args(cls, args):
+        streaming = getattr(args, "data_type", "") == "chatimg"
         return cls(
             dataset_path=args.data_file,
             processor_path=args.processor_path,
@@ -365,6 +477,7 @@ class HFDataModule(L.LightningDataModule):
             persistent_workers=getattr(args, "persistent_workers", False),
             prefetch_factor=getattr(args, "prefetch_factor", None),
             max_inflight_batches=getattr(args, "max_inflight_batches", 2),
+            streaming=streaming,
         )
 
     def prepare_data(self):
@@ -376,14 +489,24 @@ class HFDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         if stage in (None, 'fit') and self.train_dataset is None:
-            self.train_dataset = HFDataset(
-                dataset_path=self.dataset_path,
-                processor_path=self.processor_path,
-                split=self.train_split,
-                num_proc=self.num_proc,
-                seqlen=self.seqlen,
-                cache_dir=self.cache_dir,
-            )
+            if self.streaming:
+                self.train_dataset = HFStreamingDataset(
+                    dataset_path=self.dataset_path,
+                    processor_path=self.processor_path,
+                    split=self.train_split,
+                    seqlen=self.seqlen,
+                    shuffle_buffer=self.shuffle_buffer,
+                    cache_dir=self.cache_dir,
+                )
+            else:
+                self.train_dataset = HFDataset(
+                    dataset_path=self.dataset_path,
+                    processor_path=self.processor_path,
+                    split=self.train_split,
+                    num_proc=self.num_proc,
+                    seqlen=self.seqlen,
+                    cache_dir=self.cache_dir,
+                )
 
         if stage in (None, 'fit', 'validate') and self.val_split is not None and self.val_dataset is None:
             self.val_dataset = HFDataset(
@@ -418,7 +541,24 @@ class HFDataModule(L.LightningDataModule):
             dataloader_kwargs["multiprocessing_context"] = multiprocessing_context
         return DataLoader(**dataloader_kwargs)
 
+    def _build_streaming_dataloader(self, dataset):
+        num_workers = self.num_workers
+        kwargs = {
+            "dataset": dataset,
+            "batch_size": self.batch_size,
+            "num_workers": num_workers,
+            "pin_memory": self.pin_memory,
+            "collate_fn": hf_collate_fn,
+            "worker_init_fn": _clear_processor_cache,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = self.persistent_workers
+            kwargs["prefetch_factor"] = self.prefetch_factor or 2
+        return DataLoader(**kwargs)
+
     def train_dataloader(self):
+        if self.streaming:
+            return self._build_streaming_dataloader(self.train_dataset)
         return self._build_dataloader(self.train_dataset, self.shuffle)
 
     def val_dataloader(self):
@@ -427,9 +567,9 @@ class HFDataModule(L.LightningDataModule):
         return self._build_dataloader(self.val_dataset, False)
 
     def teardown(self, stage=None):
-        if self.train_dataset is not None:
+        if self.train_dataset is not None and hasattr(self.train_dataset, 'release'):
             self.train_dataset.release()
-        if self.val_dataset is not None:
+        if self.val_dataset is not None and hasattr(self.val_dataset, 'release'):
             self.val_dataset.release()
 
         if stage in (None, 'fit', 'validate', 'test', 'predict'):

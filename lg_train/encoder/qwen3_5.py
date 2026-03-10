@@ -15,7 +15,7 @@ class Qwen3_5VLEncoder(nn.Module):
         self.encoder_dim = self.encoder.config.out_hidden_size
 
     def forward(self, pixel_values: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor | None = None):
+        image_grid_thw: torch.LongTensor):
         # vision_output: BaseModelOutputWithPooling = self.encoder(
         #     pixel_values, image_grid_thw
         # )
@@ -27,7 +27,7 @@ class Qwen3_5VLEncoder(nn.Module):
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
-        image_grid_thw: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor,
         ) -> BaseModelOutputWithPooling:
         r"""
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):

@@ -28,14 +28,14 @@ class ModRWKV(pl.LightningModule):
         self.image_token_id = 65532
         encoder_config = {
             'encoder_path': args.encoder_path,
-            'project_dim' : args.n_embd
+            # 'project_dim' : args.n_embd
         }
         self.encoder = Encoder_Registry[args.encoder_type](**encoder_config)
         proj_config = {
-            'encoder_dim': 768,
+            'encoder_dim': self.encoder.encoder_dim,
             'project_dim': args.n_embd,
         }
-        self.proj = Projector_Registry[args.encoder_type] (**proj_config)
+        self.proj = Projector_Registry[args.encoder_type](**proj_config)
 
         self.llm = RWKV7(args)
     def get_input_embeddings(self):
@@ -83,9 +83,34 @@ class ModRWKV(pl.LightningModule):
         if "rwkv" in part:
             for p in self.llm.parameters():
                 p.requires_grad = True
+
+    def _encode_sign(self, sign):
+        if sign is None:
+            return None
+
+        if isinstance(sign, dict):
+            if "image_grid_thw" in sign:
+                image_features = self.encoder(sign["pixel_values"], sign["image_grid_thw"])
+            else:
+                image_features = self.encoder(sign["pixel_values"])
+        else:
+            image_features = self.encoder(sign)
+
+        if isinstance(image_features, (list, tuple)):
+            projected_features = []
+            for feature in image_features:
+                if feature.dim() == 2:
+                    feature = feature.unsqueeze(0)
+                projected = self.proj(feature)
+                projected_features.append(projected.reshape(-1, projected.shape[-1]))
+            if not projected_features:
+                return None
+            return torch.cat(projected_features, dim=0)
+
+        return self.proj(image_features).reshape(-1, self.args.n_embd)
     
     def get_images_embeds(self, sign):
-        return self.proj(self.encoder(sign))
+        return self._encode_sign(sign)
     
     def forward(self, input_ids=None, inputs_embeds=None, signs= None, state = None):
 
@@ -95,17 +120,22 @@ class ModRWKV(pl.LightningModule):
         if signs is not None and len(signs)>0:
             images_embeds = []
             for sign in signs:
-                images_embed = self.proj(self.encoder(sign))
+                if sign is None:
+                    continue
+                images_embed = self._encode_sign(sign)
+                if images_embed is None:
+                    continue
                 images_embeds.append(images_embed)
-            images_embeds = torch.cat(images_embeds, dim=0).view(-1, inputs_embeds.shape[-1])
-            # images_embeds = torch.cat([self.encoder(sign) for sign in signs], dim=0)
-            # images_embeds = images_embeds.view(-1, images_embeds.shape[-1])
-            # images_embeds = self.proj(images_embeds)  # images_embeds need [B*num_imgs,llm_dim]
-            image_mask = self.get_placeholder_mask(
-                input_ids, inputs_embeds=inputs_embeds, image_features=images_embeds
-            )
-            
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, images_embeds)
+            if images_embeds:
+                images_embeds = torch.cat(images_embeds, dim=0)
+                n_image_tokens = (input_ids == self.image_token_id).sum().item()
+                if images_embeds.shape[0] > n_image_tokens > 0:
+                    images_embeds = images_embeds[:n_image_tokens]
+                image_mask = self.get_placeholder_mask(
+                    input_ids, inputs_embeds=inputs_embeds, image_features=images_embeds
+                )
+
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, images_embeds)
         logits = self.llm(inputs_embeds=inputs_embeds)
 
         return logits
@@ -115,7 +145,7 @@ class ModRWKV(pl.LightningModule):
 
         
         signs, text_tokens, text_labels = batch
-        signs, idx, targets = [sub for sub in signs if sub is not None] , text_tokens.cuda(), text_labels.cuda()
+        idx, targets = text_tokens.cuda(), text_labels.cuda()
         logits = self(input_ids=idx, signs=signs)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 

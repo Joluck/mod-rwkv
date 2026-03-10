@@ -188,11 +188,14 @@ class train_callback(pl.Callback):
             dataset = trainer.train_dataloader.dataset
         else:
             dataset = trainer.train_dataloader.dataset.datasets
-        # assert "MyDataset" in str(dataset)
-        dataset.global_rank = trainer.global_rank
-        dataset.real_epoch = int(args.epoch_begin + trainer.current_epoch)
-        dataset.world_size = trainer.world_size
-        # print(f'########## world_size {dataset.world_size} global_rank {dataset.global_rank} real_epoch {dataset.real_epoch} ##########')
+
+        real_epoch = int(args.epoch_begin + trainer.current_epoch)
+        if hasattr(dataset, 'set_epoch'):
+            dataset.set_epoch(real_epoch)
+        else:
+            dataset.global_rank = trainer.global_rank
+            dataset.real_epoch = real_epoch
+            dataset.world_size = trainer.world_size
 
     def on_train_epoch_end(self, trainer, pl_module):
         args = self.args
