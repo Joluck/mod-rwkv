@@ -101,8 +101,6 @@ class train_callback(pl.Callback):
                         name=args.run_name + " " + args.my_timestamp,
                         config=args,
                         save_code=False,
-                        mode='offline',
-
                     )
                     trainer.my_wandb = wandb
 
@@ -115,6 +113,8 @@ class train_callback(pl.Callback):
             loss = outputs['loss']
             if int(args.devices)>1:
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.SUM)
+
+        img_tokens = getattr(pl_module, '_last_img_tokens', 0)
 
         if trainer.is_global_zero:  # logging
             t_now = time.time_ns()
@@ -129,6 +129,7 @@ class train_callback(pl.Callback):
             except:
                 pass
             trainer.my_time_ns = t_now
+            self.log("img_tok", img_tokens, prog_bar=True, on_step=True)
             if pl.__version__[0]=='2':
                 trainer.my_loss = loss*trainer.accumulate_grad_batches/int(args.devices)
             else:
@@ -145,7 +146,7 @@ class train_callback(pl.Callback):
                 args.avg_loss += trainer.my_loss / trainer.accumulate_grad_batches
                 if (batch_idx+1) % trainer.accumulate_grad_batches == 0:
                     if len(args.wandb) > 0:
-                        lll = {"loss": args.avg_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9}
+                        lll = {"loss": args.avg_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9, "img_tok": img_tokens}
                         if kt_s > 0:
                             lll["kt/s"] = kt_s
                         trainer.my_wandb.log(lll, step=int(real_step))
@@ -153,13 +154,13 @@ class train_callback(pl.Callback):
                     args.avg_loss = 0
             else:
                 if len(args.wandb) > 0:
-                    lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9}
+                    lll = {"loss": trainer.my_loss, "lr": trainer.my_lr, "wd": trainer.my_wd, "Gtokens": real_step * token_per_step / 1e9, "img_tok": img_tokens}
                     if kt_s > 0:
                         lll["kt/s"] = kt_s
                     trainer.my_wandb.log(lll, step=int(real_step))
                 self.write_data(trainer.my_loss, t_cost, kt_s)
 
-            if trainer.global_step % 2000 == 0:
+            if trainer.global_step > 0 and trainer.global_step % 1024 == 0:
                 to_save_dict = pl_module.state_dict()
                 try:
                     my_save(

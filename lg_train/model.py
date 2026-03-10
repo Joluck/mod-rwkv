@@ -143,9 +143,12 @@ class ModRWKV(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         args = self.args
 
-        
         signs, text_tokens, text_labels = batch
         idx, targets = text_tokens.cuda(), text_labels.cuda()
+
+        n_img_tokens = (idx == self.image_token_id).sum().item()
+        self._last_img_tokens = n_img_tokens
+
         logits = self(input_ids=idx, signs=signs)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
