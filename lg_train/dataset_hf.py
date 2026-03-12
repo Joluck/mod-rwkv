@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoProcessor
 
 
-os.environ.setdefault("HF_DATASETS_CACHE", "/mnt/raid0_8t/huggingface/datasets")
+os.environ.setdefault("HF_DATASETS_CACHE", "~/.cache/huggingface/datasets")
 
 
 ROLE_TABLE = {
