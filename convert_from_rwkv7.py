@@ -168,8 +168,9 @@ def convert(
 
     os.makedirs(output, exist_ok=True)
 
-    model.save_pretrained(output, max_shard_size="1000GB")
-    from safetensors.torch import load_file, save_file
+    config.save_pretrained(output)
+    save_file(model.state_dict(), os.path.join(output, 'model.safetensors'))
+    from safetensors.torch import load_file
     merged = {}
     llm_weights = load_file(output+'/model.safetensors')
     # safetensor1 key 加 model. 前缀

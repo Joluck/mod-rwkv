@@ -106,6 +106,117 @@ HF_ENDPOINT="https://hf-mirror.com" python world_train.py \   # 中国用户使�
 --my_testing "x070" --train_step proj rwkv #train_step 选择你要训练的部分，proj、rwkv
 ```
 
+## Hugging Face Export
+
+This repo provides a Hugging Face export path for the Qwen3.5-based visual encoder, the custom ModRWKV processor, and a trained ModRWKV VLM checkpoint.
+
+### 1. Export the ViT bundle
+
+`preprocess/export_qwen35_enc.py` exports the Qwen3.5 vision encoder that is used by the multimodal wrapper.
+
+```bash
+python preprocess/export_qwen35_enc.py \
+  --model_path Qwen/Qwen3.5-0.8B \
+  --output_path vision_bundle \
+  --max_image_tokens 4096
+```
+
+This writes a Hugging Face-compatible vision bundle into `vision_bundle/`.
+
+### 2. Export the processor bundle
+
+`wrapper/export_processor.py` exports the tokenizer, chat template, and image processor assets required by `AutoProcessor`.
+
+```bash
+python wrapper/export_processor.py \
+  --output-dir processor_bundle \
+  --image-processor Qwen/Qwen3.5-0.8B \
+  --max-image-tokens 4096 \
+  --force
+```
+
+This writes the processor files into `processor_bundle/` and runs a small load test after export.
+
+### 3. Export the trained VLM bundle
+
+`export_hf_model.py` combines:
+
+- the trained RWKV checkpoint
+- the exported vision bundle
+- the exported processor bundle
+- the remote-code wrapper files
+
+into a single Hugging Face directory that can be loaded with `trust_remote_code=True`.
+
+```bash
+python export_hf_model.py \
+  --checkpoint rwkv7-0.4b-sft-qwen3_5/rwkv-step-1024.pth \
+  --vision-bundle vision_bundle \
+  --processor-bundle processor_bundle \
+  --output-dir hf_export_test \
+  --overwrite
+```
+
+The exported directory contains model weights, `config.json`, processor assets, and the Python files needed for remote-code loading.
+
+### 4. Load the exported VLM
+
+For a visual-language model, prefer `AutoModelForImageTextToText` instead of `AutoModel`.
+
+```python
+from PIL import Image
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+bundle_path = "hf_export_test"
+
+processor = AutoProcessor.from_pretrained(bundle_path, trust_remote_code=True)
+model = AutoModelForImageTextToText.from_pretrained(
+    bundle_path,
+    trust_remote_code=True,
+).to("cuda")
+
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": Image.open("docs/03-Confusing-Pictures.jpg").convert("RGB")},
+            {"type": "text", "text": "Describe this image."},
+        ],
+    }
+]
+
+inputs = processor.apply_chat_template(
+    messages,
+    tokenize=True,
+    add_generation_prompt=True,
+    return_dict=True,
+    return_tensors="pt",
+)
+inputs = {k: v.to("cuda") if hasattr(v, "to") else v for k, v in inputs.items()}
+
+generated = model.generate(
+    **inputs,
+    max_new_tokens=64,
+    do_sample=False,
+    use_cache=True,
+)
+
+print(processor.batch_decode(generated, skip_special_tokens=False)[0])
+```
+
+Use `AutoModelForCausalLM` if you specifically want the causal-LM class, but `AutoModelForImageTextToText` is the intended multimodal entry point.
+
+### 5. Smoke test the exported bundle
+
+You can validate an exported bundle with:
+
+```bash
+python wrapper/test_exported_model.py \
+  --bundle-path hf_export_test \
+  --device cuda
+```
+
+
 ## Web-demo (Using Gradio)
 ```
 python audio_multiturns_web.py # For Audio QA and ASR
