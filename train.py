@@ -172,7 +172,7 @@ args.real_bsz = int(args.num_nodes) * int(args.devices) * args.micro_bsz
 
 if args.epoch_steps < 0:
     from datasets import load_dataset_builder
-    _cache_dir = os.environ.get("HF_DATASETS_CACHE")
+    _cache_dir = os.environ.get("HF_DATASETS_CACHE", "~/.cache/huggingface/datasets")
     _builder = load_dataset_builder(args.data_file, cache_dir=_cache_dir)
     _split = getattr(args, "sft_split", "train")
     _total_samples = _builder.info.splits[_split].num_examples

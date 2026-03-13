@@ -110,12 +110,16 @@ HF_ENDPOINT="https://hf-mirror.com" python world_train.py \   # 中国用户使�
 
 This repo provides a Hugging Face export path for the Qwen3.5-based visual encoder, the custom ModRWKV processor, and a trained ModRWKV VLM checkpoint.
 
+### 0. Dataset Splitting
+
+Current dataloading uses `datasets.load_dataset_builder` method, which won't generate splittings, a dataset without generating splits will have empty `DatasetInfo` and cause errors. The simplest fix is to run `python -c "from datasets import load_dataset; load_dataset('<your dataset path>')"` before training.
+
 ### 1. Export the ViT bundle
 
-`preprocess/export_qwen35_enc.py` exports the Qwen3.5 vision encoder that is used by the multimodal wrapper.
+`export/export_qwen35_enc.py` exports the Qwen3.5 vision encoder that is used by the multimodal wrapper.
 
 ```bash
-python preprocess/export_qwen35_enc.py \
+python wrapper/export_qwen35_enc.py \
   --model_path Qwen/Qwen3.5-0.8B \
   --output_path vision_bundle \
   --max_image_tokens 4096
