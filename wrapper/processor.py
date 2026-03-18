@@ -27,7 +27,7 @@ CHAT_TEMPLATE = (
     "{% endif %}"
     "{{ '\x17' }}"
     "{% endfor %}"
-    "{% if add_generation_prompt %}{{ '\x16Assistant: <think></think>' }}{% endif %}"
+    "{% if add_generation_prompt %}{{ '\x16Assistant: ' }}{% endif %}"
 )
 
 
@@ -186,10 +186,9 @@ class ModRWKVProcessor(ProcessorMixin):
                     text[i] = self._append_missing_image_tags(text[i], missing_image_tags)
                 while self.image_token in text[i]:
                     if index >= len(num_image_tokens):
-                        raise ValueError(
-                            "Number of image placeholders in text exceeds provided images: "
-                            f"consumed {index + 1}, available {len(num_image_tokens)}."
-                        )
+                        # More <image> tags than actual images — strip the extras
+                        text[i] = text[i].replace(self.vision_image_token, "")
+                        break
                     text[i] = text[i].replace(self.image_token, "<|placeholder|>" * num_image_tokens[index], 1)
                     expected_image_tokens[i] += num_image_tokens[index]
                     expected_num_images[i] += 1

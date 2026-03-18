@@ -21,6 +21,14 @@ ROLE_TABLE = {
     "gpt": "assistant",
 }
 
+# Sources that contain <loc_*> grounding tags incompatible with our tokenizer.
+_SKIP_SOURCES = frozenset({
+    "SynthChartNet",
+    "SynthFormulaNet",
+    "SynthCodeNet",
+    "DoclingMatix",
+})
+
 
 _PROCESSOR_CACHE = {}
 
@@ -103,6 +111,7 @@ def _normalize_images(images):
 SYN_TOKEN_ID = 23   # \x16 — turn start
 ETB_TOKEN_ID = 24   # \x17 — turn end
 ASSISTANT_PREFIX_IDS = (23, 5585, 41693, 59)  # "\x16Assistant:"
+_MAX_ASPECT_RATIO = 50
 
 
 def _build_labels(input_ids, seqlen, pad_token_id=0):
@@ -139,7 +148,7 @@ class HFStreamingDataset(IterableDataset):
     """Streaming dataset that reads HF parquet files on-the-fly without caching."""
 
     def __init__(self, dataset_path, processor_path, split='train', seqlen=4096,
-                 shuffle_buffer=1000, seed=42, cache_dir=None):
+                 shuffle_buffer=512, seed=42, cache_dir=None):
         self.dataset_path = dataset_path
         self.processor_path = processor_path
         self.split = split
@@ -205,6 +214,8 @@ class HFStreamingDataset(IterableDataset):
         for i, sample in enumerate(ds):
             if skip_mod is not None and i % skip_mod[0] != skip_mod[1]:
                 continue
+            if sample.get("source", "") in _SKIP_SOURCES:
+                continue
             try:
                 yield _process_sample(sample, processor, self.seqlen)
             except Exception as e:
@@ -213,9 +224,17 @@ class HFStreamingDataset(IterableDataset):
                 continue
 
 
+
 def _process_sample(sample, processor, seqlen):
     texts, images = _normalize_chat(sample)
     images = _normalize_images(images)
+    for img in images:
+        w, h = img.size
+        if w == 0 or h == 0:
+            raise ValueError("image has zero width or height")
+        ratio = max(w / h, h / w)
+        if ratio > _MAX_ASPECT_RATIO:
+            raise ValueError(f"aspect ratio {ratio:.1f} exceeds limit {_MAX_ASPECT_RATIO}")
     messages = _build_messages(texts, images)
     rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
 
@@ -326,7 +345,7 @@ class HFDataModule(L.LightningDataModule):
         }
         if self.num_workers > 0:
             kwargs["persistent_workers"] = self.persistent_workers
-            kwargs["prefetch_factor"] = self.prefetch_factor or 2
+            kwargs["prefetch_factor"] = max(self.prefetch_factor, 1) if self.prefetch_factor is not None else 2
         return DataLoader(**kwargs)
 
     def train_dataloader(self):

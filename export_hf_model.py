@@ -236,6 +236,8 @@ def create_text_config(components: Dict[str, Dict[str, torch.Tensor]], original_
         gate_low_rank_dim=gate_low_rank_dim,
         a_low_rank_dim=a_low_rank_dim,
         v_low_rank_dim=v_low_rank_dim,
+        bos_token_id=23,
+        eos_token_id=24,
         attn_mode="chunk",
         fuse_cross_entropy=True,
         fuse_linear_cross_entropy=False,
@@ -351,7 +353,7 @@ def patch_config_auto_map(output_dir: Path) -> None:
 
     config_data["auto_map"] = {
         "AutoConfig": "modeling_modrwkv.ModRWKVConfig",
-        "AutoModel": "modeling_modrwkv.RWKV7VLModel",
+        "AutoModel": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
         "AutoModelForCausalLM": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
         "AutoModelForImageTextToText": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
     }
@@ -419,7 +421,7 @@ def export_bundle(args: argparse.Namespace) -> Path:
     config.torch_dtype = dtype_name
     config.auto_map = {
         "AutoConfig": "modeling_modrwkv.ModRWKVConfig",
-        "AutoModel": "modeling_modrwkv.RWKV7VLModel",
+        "AutoModel": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
         "AutoModelForCausalLM": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
         "AutoModelForImageTextToText": "modeling_modrwkv.RWKV7VLForConditionalGeneration",
     }

@@ -57,7 +57,12 @@ def allowed_pixels_from_max_image_tokens(max_image_tokens: int, patch_size: int 
 
 def build_tokenizer():
     vocab_path = Path(__file__).with_name("wr_vocab_v20230424.txt")
-    return RwkvTokenizer(vocab_file=str(vocab_path))
+    tokenizer = RwkvTokenizer(vocab_file=str(vocab_path))
+    if tokenizer.pad_token_id != tokenizer.eos_token_id:
+        raise ValueError(
+            f"expected pad_token_id to match eos_token_id, got pad={tokenizer.pad_token_id} eos={tokenizer.eos_token_id}"
+        )
+    return tokenizer
 
 
 def build_processor(image_processor_name_or_path=None, max_image_tokens:int=None):
@@ -124,6 +129,11 @@ def test_saved_processor(processor_path):
 
     processor = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
     print(processor)
+    print("pad_token_id:", processor.tokenizer.pad_token_id, "eos_token_id:", processor.tokenizer.eos_token_id)
+    if processor.tokenizer.pad_token_id != processor.tokenizer.eos_token_id:
+        raise ValueError(
+            f"reloaded tokenizer pad_token_id={processor.tokenizer.pad_token_id} does not match eos_token_id={processor.tokenizer.eos_token_id}"
+        )
 
     messages = [
         {

@@ -236,11 +236,18 @@ class RWKV7VLModel(ModRWKVPreTrainedModel):
 
         special_image_mask = input_ids == self.config.image_token_id
 
-        n_image_tokens = special_image_mask.sum()
+        n_image_tokens = special_image_mask.sum().item()
+        n_image_features = image_features.shape[0]
+
+        if n_image_tokens > n_image_features:
+            # More image tokens than features — only fill the first n positions
+            image_positions = special_image_mask.nonzero(as_tuple=False)
+            excess = image_positions[n_image_features:]
+            special_image_mask[excess[:, 0], excess[:, 1]] = False
+
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
 
         if inputs_embeds[special_image_mask].numel() != image_features.numel():
-            n_image_features = image_features.shape[0] * image_features.shape[1]
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
@@ -534,10 +541,10 @@ class RWKV7VLForConditionalGeneration(ModRWKVPreTrainedModel, FLAGenerationMixin
 
 # Register models with AutoModel
 AutoConfig.register(ModRWKVConfig.model_type, ModRWKVConfig, exist_ok=True)
-AutoModel.register(ModRWKVConfig, RWKV7VLModel, exist_ok=True)
+AutoModel.register(ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True)
 AutoModelForCausalLM.register(ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True)
 AutoModelForImageTextToText.register(ModRWKVConfig, RWKV7VLForConditionalGeneration, exist_ok=True)
 
 ModRWKVConfig.register_for_auto_class("AutoConfig")
-RWKV7VLModel.register_for_auto_class("AutoModel")
+RWKV7VLForConditionalGeneration.register_for_auto_class("AutoModel")
 RWKV7VLForConditionalGeneration.register_for_auto_class("AutoModelForCausalLM")

@@ -159,9 +159,10 @@ class RwkvTokenizer(PreTrainedTokenizer):
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
-        self, vocab_file, bos_token="<|rwkv_tokenizer_end_of_text|>", 
-        eos_token="<|rwkv_tokenizer_end_of_text|>", 
-        unk_token="<|rwkv_tokenizer_end_of_text|>", 
+        self, vocab_file, bos_token="\x16",
+        eos_token="\x17",
+        pad_token="\x17",
+        unk_token="<|rwkv_tokenizer_end_of_text|>",
         chat_template=None,
         **kwargs
     ):
@@ -181,10 +182,19 @@ class RwkvTokenizer(PreTrainedTokenizer):
         vocab = self.trie_tokenizer.token2idx
         self.encoder = vocab
         self.decoder = {v: k for k, v in vocab.items()}
-        self._added_tokens_decoder = {0: AddedToken(str(bos_token))}
+        self._added_tokens_decoder = {
+            0: AddedToken(str(unk_token)),
+            self.encoder[str(bos_token).encode("utf-8")]: AddedToken(str(bos_token), special=True),
+            self.encoder[str(eos_token).encode("utf-8")]: AddedToken(str(eos_token), special=True),
+        }
         self.chat_template = CHAT_TEMPLATE if chat_template is None else chat_template
         super().__init__(
-            bos_token=bos_token, eos_token=eos_token, unk_token=unk_token, chat_template=self.chat_template, **kwargs
+            bos_token=bos_token,
+            eos_token=eos_token,
+            pad_token=pad_token,
+            unk_token=unk_token,
+            chat_template=self.chat_template,
+            **kwargs,
         )
 
         # Add vision special tokens to added_tokens_encoder for proper handling
@@ -356,4 +366,3 @@ if __name__ == "__main__":
 
     # outputs = tokenizer.decode(inputs["input_ids"], skip_special_tokens=False)
     # print(outputs)
-
